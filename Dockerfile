@@ -4,6 +4,10 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y git gcc && rm -rf /var/lib/apt/lists/*
 
+# Install pyquotex from GitHub first (needs git)
+RUN pip install --no-cache-dir git+https://github.com/cleitonleonel/pyquotex.git
+
+# Then install everything else
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

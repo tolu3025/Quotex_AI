@@ -5,5 +5,5 @@ python-telegram-bot>=20.0
 python-dotenv
 sqlalchemy
 apscheduler
-pyquotex
+pyquotex @ git+https://github.com/cleitonleonel/pyquotex.git
 
