@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: quotex-ai-bot
+    runtime: docker
+    plan: starter
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: QUOTEX_EMAIL
+        sync: false
+      - key: QUOTEX_PASSWORD
+        sync: false
+      - key: QUOTEX_SSID
+        sync: false
+      - key: QUOTEX_DEMO
+        value: "true"
+      - key: ASSET
+        value: EURUSD_otc,GBPUSD_otc,USDJPY_otc,AUDUSD_otc,USDCAD_otc
+      - key: TIMEFRAME
+        value: "60"
+      - key: AMOUNT
+        value: "100.0"
+      - key: MIN_CONFIDENCE
+        value: "70.0"
+      - key: PAPER_TRADING
+        value: "true"
+      - key: MAX_DAILY_LOSS
+        value: "500.0"
+      - key: MAX_DAILY_TRADES
+        value: "50"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DATABASE_URL
+        value: sqlite:///quotex_ai.db
+      - key: LOG_LEVEL
+        value: INFO

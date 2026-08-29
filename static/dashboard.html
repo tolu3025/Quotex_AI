@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quotex AI Signals</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; 
+      background: #0a0a0a; 
+      color: #00ff88; 
+      padding: 20px;
+      line-height: 1.6;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 10px; }
+    .status { 
+      background: #111; 
+      border: 1px solid #00ff88; 
+      padding: 15px; 
+      border-radius: 8px; 
+      margin-bottom: 20px;
+    }
+    .status-item { display: flex; justify-content: space-between; padding: 5px 0; }
+    .card { 
+      background: #111; 
+      border: 1px solid #333; 
+      padding: 15px; 
+      margin: 10px 0; 
+      border-radius: 8px;
+    }
+    .UP { color: #00ff88; }
+    .DOWN { color: #ff4444; }
+    .NO_TRADE { color: #888; }
+    .WIN { color: #00ff88; }
+    .LOSS { color: #ff4444; }
+    table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 0.85rem; }
+    th, td { border: 1px solid #222; padding: 10px 8px; text-align: left; }
+    th { background: #111; color: #00ff88; position: sticky; top: 0; }
+    tr:hover { background: #1a1a1a; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: bold;
+    }
+    .badge-good { background: #00ff8822; color: #00ff88; }
+    .badge-weak { background: #ffaa0022; color: #ffaa00; }
+    .badge-high { background: #00aaff22; color: #00aaff; }
+    .refresh { 
+      position: fixed; 
+      bottom: 20px; 
+      right: 20px; 
+      background: #00ff88; 
+      color: #000; 
+      border: none; 
+      padding: 12px 20px; 
+      border-radius: 50px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    @media (max-width: 600px) {
+      body { padding: 10px; }
+      table { font-size: 0.7rem; }
+      th, td { padding: 6px 4px; }
+    }
+  </style>
+</head>
+<body>
+  <h1>🧠 OTC AI Signal Engine</h1>
+  
+  <div class="status" id="status">
+    <div class="status-item"><span>Status:</span> <span id="bot-status">Loading...</span></div>
+    <div class="status-item"><span>Mode:</span> <span id="bot-mode">-</span></div>
+    <div class="status-item"><span>Asset:</span> <span id="bot-asset">-</span></div>
+    <div class="status-item"><span>Min Confidence:</span> <span id="bot-conf">-</span></div>
+    <div class="status-item"><span>Amount:</span> <span id="bot-amount">-</span></div>
+  </div>
+
+  <h2>📊 Recent Signals</h2>
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Asset</th><th>Pred</th><th>Conf</th><th>Type</th></tr>
+      </thead>
+      <tbody id="signals-body">
+        <tr><td colspan="5" style="text-align:center;color:#666">Loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>💰 Recent Trades</h2>
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Asset</th><th>Dir</th><th>Amount</th><th>Result</th><th>P&L</th></tr>
+      </thead>
+      <tbody id="trades-body">
+        <tr><td colspan="6" style="text-align:center;color:#666">Loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <button class="refresh" onclick="loadAll()">🔄 Refresh</button>
+
+  <script>
+    const API = window.location.origin;
+
+    function timeAgo(iso) {
+      const d = new Date(iso);
+      const now = new Date();
+      const secs = Math.floor((now - d) / 1000);
+      if (secs < 60) return secs + 's ago';
+      if (secs < 3600) return Math.floor(secs/60) + 'm ago';
+      return Math.floor(secs/3600) + 'h ago';
+    }
+
+    function badgeClass(type) {
+      if (type === 'HIGH') return 'badge-high';
+      if (type === 'GOOD') return 'badge-good';
+      if (type === 'WEAK') return 'badge-weak';
+      return '';
+    }
+
+    async function loadStatus() {
+      try {
+        const r = await fetch(API + '/');
+        const d = await r.json();
+        document.getElementById('bot-status').textContent = d.bot_running ? '🟢 Running' : '🔴 Stopped';
+        document.getElementById('bot-mode').textContent = d.paper_trading ? '📄 Paper' : '💰 Live';
+        document.getElementById('bot-asset').textContent = d.asset;
+        document.getElementById('bot-conf').textContent = d.min_confidence + '%';
+        document.getElementById('bot-amount').textContent = '₦' + d.amount;
+      } catch(e) {}
+    }
+
+    async function loadSignals() {
+      try {
+        const r = await fetch(API + '/signals?limit=20');
+        const rows = await r.json();
+        const tbody = document.getElementById('signals-body');
+        if (rows.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#666">No signals yet</td></tr>';
+          return;
+        }
+        tbody.innerHTML = rows.map(x => `
+          <tr class="${x.prediction}">
+            <td>${timeAgo(x.time)}</td>
+            <td>${x.asset}</td>
+            <td class="${x.prediction}">${x.prediction}</td>
+            <td>${x.confidence}%</td>
+            <td><span class="badge ${badgeClass(x.type)}">${x.type}</span></td>
+          </tr>
+        `).join('');
+      } catch(e) {}
+    }
+
+    async function loadTrades() {
+      try {
+        const r = await fetch(API + '/trades?limit=20');
+        const rows = await r.json();
+        const tbody = document.getElementById('trades-body');
+        if (rows.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#666">No trades yet</td></tr>';
+          return;
+        }
+        tbody.innerHTML = rows.map(x => `
+          <tr>
+            <td>${timeAgo(x.time)}</td>
+            <td>${x.asset}</td>
+            <td>${x.direction}</td>
+            <td>₦${x.amount}</td>
+            <td class="${x.result || ''}">${x.result || 'PENDING'}</td>
+            <td style="color:${(x.profit||0)>=0?'#00ff88':'#ff4444'}">${x.profit ? '₦'+x.profit.toFixed(2) : '-'}</td>
+          </tr>
+        `).join('');
+      } catch(e) {}
+    }
+
+    function loadAll() {
+      loadStatus();
+      loadSignals();
+      loadTrades();
+    }
+
+    loadAll();
+    setInterval(loadAll, 30000);
+  </script>
+</body>
+</html>
+

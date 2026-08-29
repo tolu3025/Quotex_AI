@@ -1,0 +1,9 @@
+httpx
+fastapi
+uvicorn
+python-telegram-bot>=20.0
+python-dotenv
+sqlalchemy
+apscheduler
+pyquotex
+
