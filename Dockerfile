@@ -2,12 +2,25 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y git gcc && rm -rf /var/lib/apt/lists/*
+# Install ALL build dependencies pyquotex needs
+RUN apt-get update && apt-get install -y \
+    git \
+    gcc \
+    build-essential \
+    python3-dev \
+    libffi-dev \
+    libssl-dev \
+    libxml2-dev \
+    libxslt1-dev \
+    curl \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install pyquotex from GitHub first (needs git)
-RUN pip install --no-cache-dir git+https://github.com/cleitonleonel/pyquotex.git
+# Install Rust (needed by some JSON/websocket libs)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Then install everything else
+# Copy and install requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
