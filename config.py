@@ -26,4 +26,12 @@ class Config:
     DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///quotex_ai.db")
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
+    # OTC TIMING
+    SIGNAL_MAX_AGE_MS = float(os.getenv("SIGNAL_MAX_AGE_MS", "300.0"))
+    SLIPPAGE_MAX_PCT = float(os.getenv("SLIPPAGE_MAX_PCT", "0.05"))
+    NETWORK_TIMEOUT = float(os.getenv("NETWORK_TIMEOUT", "25.0"))
+    TRADE_COOLDOWN_SEC = float(os.getenv("TRADE_COOLDOWN_SEC", "5.0"))
+    SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "3.0"))
+    CANDLE_TIMEOUT_SEC = float(os.getenv("CANDLE_TIMEOUT_SEC", "20.0"))  # was 10, now 20
+
 cfg = Config()
