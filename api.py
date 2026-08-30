@@ -39,6 +39,9 @@ class SafeLog:
     @classmethod
     def error(cls, *parts):
         line = cls._fmt(*parts); cls._history.append(line); logger.error(line)
+    @classmethod
+    def trade(cls, *parts):
+        line = cls._fmt(*parts); cls._history.append(line); logger.info(f"TRADE| {line}")
 
 
 async def run_bot():
@@ -58,11 +61,12 @@ async def run_bot():
         return
 
     bot_running = True
-    logger.info("BOT STARTED on Render | Assets: %s", assets)
+    SafeLog.info("BOT STARTED on Render | Assets:", assets)
 
     while bot_running:
         cycle_start = time.time()
         try:
+            # === CONCURRENT SCAN ===
             async def scan_one(asset):
                 if asset in asset_cooldown:
                     now = datetime.now(timezone.utc)
@@ -70,6 +74,7 @@ async def run_bot():
                         return None
                 raw = await qx.get_candles(asset, cfg.TIMEFRAME, 100)
                 if len(raw) < 30:
+                    SafeLog.info(f"{asset}: only {len(raw)} candles")
                     return None
                 try:
                     market_data = format_prompt_data(raw, asset)
@@ -79,40 +84,89 @@ async def run_bot():
                     pred["asset"] = asset
                     pred["raw_candles"] = raw
                     return pred
-                except Exception:
+                except Exception as e:
+                    SafeLog.error(f"{asset} predict error:", e)
                     return None
 
             tasks = [scan_one(a) for a in assets]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             best_signal = None
+            best_asset = None
             best_confidence = 0
+
             for res in results:
                 if isinstance(res, Exception) or not res:
                     continue
+                asset = res.get("asset")
                 conf = res.get("confidence", 0)
+                pred = res.get("prediction", "NO_TRADE")
+                SafeLog.info(f"{asset}: {pred} @ {conf:.0f}%")
+
                 if conf > best_confidence and conf >= cfg.MIN_CONFIDENCE:
                     best_confidence = conf
                     best_signal = res
+                    best_asset = asset
 
-            if best_signal and not cfg.PAPER_TRADING:
-                asset = best_signal["asset"]
-                now = datetime.now(timezone.utc)
+            SafeLog.info(f"BEST: asset={best_asset} conf={best_confidence}")
 
-                if now.hour != hourly_reset.hour:
-                    hourly_trades = 0
-                    hourly_reset = now
+            if not best_signal:
+                SafeLog.info("No trade this cycle.")
+                continue
 
-                if time.time() - last_trade_time >= cfg.TRADE_COOLDOWN_SEC and hourly_trades < 5 and manager.daily_loss < cfg.MAX_DAILY_LOSS:
-                    age_ms = (time.time() - best_signal.get("timestamp", 0)) * 1000
-                    if age_ms <= cfg.SIGNAL_MAX_AGE_MS:
-                        direction = "CALL" if best_signal["prediction"] == "UP" else "PUT"
-                        result = await qx.place_trade(asset, cfg.AMOUNT, direction, cfg.TIMEFRAME)
-                        logger.info("TRADE %s %s @ %s%% | Result: %s", asset, direction, best_confidence, result)
-                        asset_cooldown[asset] = now + timedelta(minutes=10)
-                        hourly_trades += 1
-                        last_trade_time = time.time()
-                        await notifier.send_signal(best_signal["prediction"], best_confidence, "GOOD", best_signal["reasoning"])
+            # === RISK CHECKS ===
+            now = datetime.now(timezone.utc)
+            if now.hour != hourly_reset.hour:
+                hourly_trades = 0
+                hourly_reset = now
+
+            # Global cooldown
+            if time.time() - last_trade_time < cfg.TRADE_COOLDOWN_SEC:
+                SafeLog.info("BLOCK: global cooldown")
+                continue
+
+            if hourly_trades >= 5:
+                SafeLog.info("BLOCK: hourly limit")
+                continue
+
+            if manager.daily_loss >= cfg.MAX_DAILY_LOSS:
+                SafeLog.error("BLOCK: daily loss limit")
+                continue
+
+            # === OTC GUARDS ===
+            signal_time = best_signal.get("timestamp", time.time())
+            age_ms = (time.time() - signal_time) * 1000
+            if age_ms > cfg.SIGNAL_MAX_AGE_MS:
+                SafeLog.info(f"REJECTED: signal too old ({age_ms:.0f}ms)")
+                continue
+
+            signal_price = best_signal.get("price_at_signal", 0)
+            raw = best_signal.get("raw_candles", [])
+            current_price = raw[-1]["close"] if raw else signal_price
+            if signal_price > 0 and current_price > 0:
+                slippage = abs(current_price - signal_price) / signal_price * 100
+                if slippage > cfg.SLIPPAGE_MAX_PCT:
+                    SafeLog.info(f"REJECTED: slippage {slippage:.3f}%")
+                    continue
+
+            # === EXECUTE ===
+            direction = "CALL" if best_signal["prediction"] == "UP" else "PUT"
+            SafeLog.trade("=" * 40)
+            SafeLog.trade(f"EXEC | {best_asset} | {direction} | {best_confidence:.0f}%")
+            SafeLog.trade(f"PRICE | signal={signal_price:.5f} current={current_price:.5f} age={age_ms:.0f}ms")
+            SafeLog.trade("=" * 40)
+
+            result = await qx.place_trade(best_asset, cfg.AMOUNT, direction, cfg.TIMEFRAME)
+            SafeLog.info("RESULT:", result)
+
+            if result and isinstance(result, tuple) and result[0] is True:
+                asset_cooldown[best_asset] = now + timedelta(minutes=10)
+                hourly_trades += 1
+                last_trade_time = time.time()
+                manager.record_signal(best_signal["prediction"], best_confidence, best_signal.get("reasoning", ""), "")
+                await notifier.send_signal(best_signal["prediction"], best_confidence, "GOOD", best_signal.get("reasoning", ""))
+            else:
+                SafeLog.error(f"TRADE FAILED: {result}")
 
         except Exception as e:
             logger.exception("Bot cycle error")
