@@ -8,7 +8,7 @@ from database import init_db
 from feature_engine import format_prompt_data
 from openai_predictor import get_prediction
 from signal_manager import SignalManager
-from alpaca_client import AlpacaClient
+from quotex_client import QuotexClient
 from telegram_bot import TelegramNotifier
 
 
@@ -73,7 +73,7 @@ for noisy in ["pyquotex", "websockets", "urllib3", "httpx"]:
 class TradingBot:
     def __init__(self):
         init_db()
-        self.qx = AlpacaClient()
+        self.qx = QuotexClient()
         self.manager = SignalManager()
         self.notifier = TelegramNotifier()
         self.running = False
@@ -93,10 +93,10 @@ class TradingBot:
         self.active_trade_until = 0.0
         self.pending_trades = []
 
+        # NEW: prevent same-asset same-direction re-entry
         self.last_trade_asset = None
         self.last_trade_direction = None
         self.last_trade_confidence = 0.0
-        self.last_status_time = 0.0
 
     def _check_hourly_reset(self):
         now = datetime.now(timezone.utc)
@@ -109,7 +109,7 @@ class TradingBot:
         if today != self.daily_profit_reset:
             self.daily_profits = 0
             self.daily_profit_reset = today
-            SafeLog.info("NEW DAY — profit counter reset")
+            SafeLog.info("🌅 NEW DAY — profit counter reset")
 
     def _can_trade(self) -> tuple[bool, str]:
         self._check_daily_profit_reset()
@@ -138,23 +138,6 @@ class TradingBot:
 
         return True, "OK"
 
-    def _get_session_info(self) -> tuple[int, str]:
-        """
-        Active sessions: Tokyo (00-09 UTC), London (08-17 UTC), New York (13-22 UTC).
-        During sessions: scan every 10 minutes. Outside: scan every 60 minutes.
-        """
-        now = datetime.now(timezone.utc)
-        hour = now.hour
-
-        if 0 <= hour < 9:
-            return 600, "Tokyo"
-        if 8 <= hour < 17:
-            return 600, "London"
-        if 13 <= hour < 22:
-            return 600, "New York"
-
-        return 3600, "OFF-HOURS"
-
     async def _check_pending_trades(self):
         now = time.time()
         for trade in self.pending_trades[:]:
@@ -166,27 +149,19 @@ class TradingBot:
                 if result == "WIN":
                     self.daily_profits += 1
                     self.consecutive_losses = 0
-                    SafeLog.trade(f"WIN #{self.daily_profits}/4 | Streak reset")
+                    SafeLog.trade(f"🎯 WIN #{self.daily_profits}/4 | Streak reset")
                     if self.daily_profits >= 4:
-                        SafeLog.trade("DAILY TARGET 4/4 — STOPPING UNTIL TOMORROW")
-                    try:
-                        asyncio.create_task(self.notifier.send_result(trade.get("deal_id", 0), "WIN", 0.0))
-                    except Exception as e:
-                        SafeLog.warn(f"Telegram result failed: {e}")
+                        SafeLog.trade("🏆 DAILY TARGET 4/4 — STOPPING UNTIL TOMORROW")
                 elif result == "LOSS":
                     self.consecutive_losses += 1
-                    SafeLog.warn(f"LOSS | Streak: {self.consecutive_losses}/3")
+                    SafeLog.warn(f"❌ LOSS | Streak: {self.consecutive_losses}/3")
                     if self.consecutive_losses >= 3:
                         self.consecutive_loss_cooldown_until = now + 600
-                        SafeLog.error("3 CONSECUTIVE LOSSES — 10 MIN COOLDOWN")
-                    try:
-                        asyncio.create_task(self.notifier.send_result(trade.get("deal_id", 0), "LOSS", 0.0))
-                    except Exception as e:
-                        SafeLog.warn(f"Telegram result failed: {e}")
+                        SafeLog.error("🛑 3 CONSECUTIVE LOSSES — 10 MIN COOLDOWN")
                 elif result == "TIE":
-                    SafeLog.info("TIE | No change")
+                    SafeLog.info("🤝 TIE | No change")
                 else:
-                    SafeLog.warn(f"UNKNOWN result")
+                    SafeLog.warn(f"❓ UNKNOWN result")
 
                 self.pending_trades.remove(trade)
 
@@ -196,25 +171,24 @@ class TradingBot:
         direction = trade.get("direction", "")
         entry_price = trade.get("entry_price", 0)
 
-        if deal_id and not deal_id.startswith("PAPER_"):
-            try:
-                status = await self.qx.get_order_status(deal_id)
-                order_status = status.get("status", "").upper()
-                filled_avg = status.get("filled_avg_price")
-                side = status.get("side", "").lower()
+        try:
+            if hasattr(self.qx.client, 'check_win') and deal_id:
+                r = await asyncio.wait_for(self.qx.client.check_win(deal_id), timeout=10.0)
+                if isinstance(r, tuple):
+                    return "WIN" if r[0] else "LOSS"
+                return "WIN" if r else "LOSS"
+        except Exception:
+            pass
 
-                SafeLog.info(f"  ALPACA ORDER | {deal_id[:20]} | status={order_status} | filled_avg={filled_avg}")
-
-                if order_status in ("FILLED", "CLOSED", "HELD") and filled_avg:
-                    candles = await self.qx.get_candles(asset, cfg.TIMEFRAME, 5)
-                    if candles:
-                        current = candles[-1]["close"]
-                        if side == "buy":
-                            return "WIN" if current > float(filled_avg) else "LOSS" if current < float(filled_avg) else "TIE"
-                        else:
-                            return "WIN" if current < float(filled_avg) else "LOSS" if current > float(filled_avg) else "TIE"
-            except Exception as e:
-                SafeLog.warn(f"  Alpaca order check failed: {e}")
+        try:
+            if hasattr(self.qx.client, 'get_trade_result') and deal_id:
+                r = await asyncio.wait_for(self.qx.client.get_trade_result(deal_id), timeout=10.0)
+                if isinstance(r, dict):
+                    profit = r.get("profit", 0)
+                    return "WIN" if profit > 0 else "LOSS" if profit < 0 else "TIE"
+                return "WIN" if r else "LOSS"
+        except Exception:
+            pass
 
         try:
             if asset and entry_price > 0 and direction:
@@ -243,40 +217,6 @@ class TradingBot:
 
         return "UNKNOWN"
 
-    async def _send_status_update(self, best_asset, best_conf, best_pred, reason):
-        now = time.time()
-        if now - self.last_status_time < 3600:
-            return
-        self.last_status_time = now
-
-        since_last = int(now - self.last_trade_time) if self.last_trade_time > 0 else 99999
-        hours_idle = since_last // 3600
-        mins_idle = (since_last % 3600) // 60
-
-        msg = (
-            f"⚪ <b>Market Status Update</b> ⚪\n\n"
-            f"<b>Assets:</b> {', '.join(self.assets)}\n"
-            f"<b>Best Signal:</b> {best_asset or 'None'}\n"
-            f"<b>Direction:</b> {best_pred or 'N/A'}\n"
-            f"<b>Confidence:</b> {best_conf:.0f}%\n"
-            f"<b>Status:</b> {reason}\n\n"
-            f"<b>Idle Time:</b> {hours_idle}h {mins_idle}m\n"
-            f"<b>Daily Wins:</b> {self.daily_profits}/4\n"
-            f"<b>Consecutive Losses:</b> {self.consecutive_losses}/3\n"
-            f"<b>Mode:</b> {'PAPER 📄' if cfg.PAPER_TRADING else 'LIVE ⚠️'}"
-        )
-
-        try:
-            if self.notifier and self.notifier.bot:
-                await self.notifier.bot.send_message(
-                    chat_id=self.notifier.chat_id,
-                    text=msg,
-                    parse_mode="HTML"
-                )
-                SafeLog.info("[STATUS] Hourly update sent to Telegram")
-        except Exception as e:
-            SafeLog.warn(f"[STATUS] Telegram failed: {e}")
-
     async def run(self):
         if not await self.qx.connect():
             SafeLog.error("Connection failed. Retrying in 30s...")
@@ -290,7 +230,7 @@ class TradingBot:
         SafeLog.info("BOT STARTED")
         SafeLog.info(f"Assets: {self.assets}")
         SafeLog.info(f"Paper: {cfg.PAPER_TRADING}")
-        SafeLog.info(f"Amount: ${cfg.AMOUNT}")
+        SafeLog.info(f"Amount: ₦{cfg.AMOUNT}")
         SafeLog.info(f"Min confidence: {cfg.MIN_CONFIDENCE}%")
         SafeLog.info(f"Daily profit target: 4 wins then STOP")
         SafeLog.info(f"Consecutive loss limit: 3 = 10 min break")
@@ -323,23 +263,8 @@ class TradingBot:
             except Exception as e:
                 SafeLog.error("Cycle crash:", e)
 
-            interval, session = self._get_session_info()
             elapsed = time.time() - cycle_start
-            sleep_for = max(0.5, interval - elapsed)
-            hour = datetime.now(timezone.utc).hour
-
-            if session != "OFF-HOURS":
-                SafeLog.info(f"[SESSION] {session} active — next scan in {sleep_for:.0f}s")
-            else:
-                next_open = ""
-                if hour < 8:
-                    next_open = f"London opens in {8 - hour}h"
-                elif hour < 13:
-                    next_open = f"New York opens in {13 - hour}h"
-                else:
-                    next_open = f"Tokyo opens in {24 - hour}h"
-                SafeLog.info(f"[SESSION] Off-hours — {next_open}, scanning in {sleep_for:.0f}s")
-
+            sleep_for = max(0.5, cfg.SCAN_INTERVAL_SEC - elapsed)
             await asyncio.sleep(sleep_for)
 
     async def _scan_asset(self, asset: str) -> dict:
@@ -362,13 +287,12 @@ class TradingBot:
     async def _scan_and_trade(self):
         can_trade, reason = self._can_trade()
         if not can_trade:
-            _, session = self._get_session_info()
             if "DAILY_PROFIT" in reason:
-                SafeLog.trade(f"DAILY TARGET MET — idle until tomorrow")
+                SafeLog.trade(f"🏆 Daily target met — idle until tomorrow")
             elif "LOSS_COOLDOWN" in reason:
-                SafeLog.warn(f"STOPPED: {reason}")
+                SafeLog.warn(f"🛑 {reason}")
             elif "TRADE_ACTIVE" not in reason:
-                SafeLog.info(f"BLOCK: {reason} | Session: {session}")
+                SafeLog.info(f"BLOCK: {reason}")
             return
 
         best_signal = None
@@ -394,22 +318,17 @@ class TradingBot:
         SafeLog.info(f"BEST: asset={best_asset} conf={best_confidence}")
 
         if not best_signal:
-            await self._send_status_update(best_asset, best_confidence, None, "No signal >= threshold")
             SafeLog.info("No trade this cycle.")
             return
 
+        # === NEW: Skip if same asset + same direction as last trade ===
         pred_dir = best_signal.get("prediction")
-        if pred_dir == "DOWN":
-            SafeLog.warn(f"SKIP: {best_asset} DOWN — Alpaca crypto cannot short-sell without holding")
-            return
-
         if (best_asset == self.last_trade_asset and 
-            pred_dir == self.last_trade_direction and
-            time.time() - self.last_trade_time < 300):
-            SafeLog.warn(f"SKIP: {best_asset} {pred_dir} — same as last trade (within 5min)")
+            pred_dir == self.last_trade_direction):
+            SafeLog.warn(f"SKIP: {best_asset} {pred_dir} @ {best_confidence:.0f}% — same as last trade")
             return
 
-        SafeLog.info(f"[REFRESH] Re-fetching fresh data for {best_asset}...")
+        SafeLog.info(f"[🔄] Re-fetching fresh data for {best_asset}...")
         fresh_raw = await self.qx.get_candles(best_asset, cfg.TIMEFRAME, 50)
         if len(fresh_raw) < 30:
             SafeLog.warn(f"{best_asset}: fresh fetch failed")
@@ -424,20 +343,20 @@ class TradingBot:
             fresh_conf = fresh_pred["confidence"]
             fresh_direction = fresh_pred["prediction"]
 
-            SafeLog.info(f"[REFRESH] Fresh: {best_asset} {fresh_direction} @ {fresh_conf:.0f}%")
+            SafeLog.info(f"[🔄] Fresh: {best_asset} {fresh_direction} @ {fresh_conf:.0f}%")
 
             if fresh_direction != best_signal["prediction"]:
-                SafeLog.warn(f"[REFRESH] FLIPPED: {best_signal['prediction']} -> {fresh_direction}. SKIP.")
+                SafeLog.warn(f"[🔄] FLIPPED: {best_signal['prediction']} → {fresh_direction}. SKIP.")
                 return
 
             if fresh_conf < cfg.MIN_CONFIDENCE:
-                SafeLog.warn(f"[REFRESH] Dropped to {fresh_conf:.0f}%. SKIP.")
+                SafeLog.warn(f"[🔄] Dropped to {fresh_conf:.0f}%. SKIP.")
                 return
 
+            # Double-check same-asset same-direction after fresh fetch
             if (best_asset == self.last_trade_asset and 
-                fresh_direction == self.last_trade_direction and
-                time.time() - self.last_trade_time < 300):
-                SafeLog.warn(f"SKIP: {best_asset} {fresh_direction} — same as last trade (fresh, within 5min)")
+                fresh_direction == self.last_trade_direction):
+                SafeLog.warn(f"SKIP: {best_asset} {fresh_direction} — same as last trade (fresh confirm)")
                 return
 
             best_signal = fresh_pred
@@ -445,7 +364,7 @@ class TradingBot:
             best_signal["raw_candles"] = fresh_raw
 
         except Exception as e:
-            SafeLog.error(f"[REFRESH] Fresh calc error: {e}")
+            SafeLog.error(f"[🔄] Fresh calc error: {e}")
             return
 
         await self._execute_trade(best_asset, best_signal)
@@ -473,16 +392,12 @@ class TradingBot:
         SafeLog.trade(f"PRICE | entry={current_price:.5f}")
         SafeLog.trade("=" * 40)
 
-        try:
-            asyncio.create_task(self.notifier.send_signal(pred, conf, "LIVE" if not cfg.PAPER_TRADING else "PAPER", reason))
-        except Exception as e:
-            SafeLog.warn(f"Telegram signal failed: {e}")
-
         now = time.time()
         self.active_trade_until = now + cfg.TIMEFRAME
         self.last_trade_time = now
         self.hourly_trades += 1
 
+        # Remember this trade to prevent repeat
         self.last_trade_asset = asset
         self.last_trade_direction = pred
         self.last_trade_confidence = conf
@@ -500,7 +415,7 @@ class TradingBot:
             })
             return
 
-        SafeLog.info(f"LIVE | {direction} {asset} @ {current_price} for ${cfg.AMOUNT}")
+        SafeLog.info(f"LIVE | {direction} {asset} @ {current_price} for ₦{cfg.AMOUNT}")
         result = await self.qx.place_trade(asset, cfg.AMOUNT, direction, cfg.TIMEFRAME)
 
         if result and isinstance(result, tuple) and result[0] is True:
@@ -522,6 +437,7 @@ class TradingBot:
             })
         else:
             SafeLog.error(f"BROKER_REJECT | {asset} | {result}")
+            # Clear memory on reject so we can retry
             self.active_trade_until = 0
 
     async def stop(self):
