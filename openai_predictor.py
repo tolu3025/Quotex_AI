@@ -89,20 +89,18 @@ async def get_prediction(market_data: dict) -> dict:
     # Clamp
     score = max(0, min(100, int(score)))
 
-    # Decision
-    if score >= 70:
+    # === THRESHOLDS: 80% minimum confidence ===
+    # UP: score >= 80 gives conf = 80-100%
+    # DOWN: score <= 20 gives conf = 80-100%
+    if score >= 80:
         pred = "UP"
         conf = float(score)
-    elif score <= 30:
+    elif score <= 20:
         pred = "DOWN"
         conf = float(100 - score)
     else:
         pred = "NO_TRADE"
-        conf = float(50)  # Fixed: was returning score which could be weird
-
-    # DEBUG: print what we calculated
-    print(f"    [DEBUG] score={score} pred={pred} conf={conf} reasons={reasons}")
-    print(f"    [DEBUG] indicators={ {k:v for k,v in ind.items() if v is not None} }")
+        conf = float(score)
 
     return {
         "prediction": str(pred),

@@ -89,46 +89,41 @@ class QuotexClient:
         await asyncio.sleep(delay)
         return await self.connect()
 
-    async def get_candles(self, asset: str, period: int = 60, count: int = 100):
-        """Fetch candles. Try primary, then fallback. Return whatever we get."""
+    async def get_candles(self, asset: str, period: int = 60, count: int = 50):
         if not self.is_healthy():
             return []
 
         try:
-            end_ts = time.time()
-            offset = period * count * 3  # Increased offset
+            offset = period * count * 2
 
-            # Primary fetch
             raw = await asyncio.wait_for(
-                self.client.get_candles(
-                    asset=asset, end_from_time=end_ts, offset=offset, period=period
+                self.client.get_historical_candles(
+                    asset=asset, amount_of_seconds=offset, period=period, max_workers=1
                 ),
                 timeout=cfg.CANDLE_TIMEOUT_SEC
             )
 
             normalized = normalize_candles(raw) if raw else []
 
-            # If primary gave us enough, return it
             if len(normalized) >= count:
-                print(f"[📊] {asset}: fetched {len(normalized)} candles (primary)")
+                print(f"[📊] {asset}: fetched {len(normalized)} candles")
                 return normalized[-count:]
 
-            # Fallback: historical candles with longer timeout
-            print(f"[⏳] {asset}: primary got {len(normalized)}, trying historical...")
+            print(f"[⏳] {asset}: historical got {len(normalized)}, trying websocket...")
             try:
+                end_ts = time.time()
                 raw2 = await asyncio.wait_for(
-                    self.client.get_historical_candles(
-                        asset=asset, amount_of_seconds=offset * 2, period=period, max_workers=1
+                    self.client.get_candles(
+                        asset=asset, end_from_time=end_ts, offset=offset, period=period
                     ),
-                    timeout=cfg.CANDLE_TIMEOUT_SEC
+                    timeout=10.0
                 )
                 if raw2:
                     normalized2 = normalize_candles(raw2)
                     normalized.extend(normalized2)
             except asyncio.TimeoutError:
-                print(f"[⚠️] {asset}: historical TIMEOUT")
+                print(f"[⚠️] {asset}: websocket TIMEOUT")
 
-            # Remove duplicates by timestamp
             seen = set()
             unique = []
             for c in sorted(normalized, key=lambda x: x["timestamp"] or 0):
@@ -158,16 +153,32 @@ class QuotexClient:
                 return (False, "Insufficient balance")
 
             print(f"[💰] Sending buy: {amount} {asset} {direction.lower()} {duration}s")
-            result = await asyncio.wait_for(
-                self.client.buy(amount, asset, direction.lower(), duration),
-                timeout=cfg.NETWORK_TIMEOUT
-            )
-            print(f"[💰] Raw response: {result}")
-            return result
 
-        except asyncio.TimeoutError:
-            return (False, "Trade timeout")
+            try:
+                result = await asyncio.wait_for(
+                    self.client.buy(amount, asset, direction.lower(), duration),
+                    timeout=45.0
+                )
+                print(f"[💰] Raw response: {result}")
+
+                if result is None:
+                    return (False, "None response")
+                if isinstance(result, bool):
+                    return (result, "Bool result")
+                if isinstance(result, tuple):
+                    return result
+                if isinstance(result, dict):
+                    status = result.get("status") or result.get("success") or result.get("result")
+                    deal_id = result.get("id") or result.get("deal_id") or result.get("ticket")
+                    return (bool(status), str(deal_id) if deal_id else str(result))
+                return (True, str(result))
+
+            except asyncio.TimeoutError:
+                print(f"[❌] Trade TIMEOUT for {asset} after 45s")
+                return (False, "Trade timeout")
+
         except Exception as e:
+            print(f"[❌] Trade error for {asset}: {e}")
             return (False, str(e))
 
     async def get_balance(self):
