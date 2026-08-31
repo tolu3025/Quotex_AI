@@ -1,8 +1,103 @@
+import os
 import time
+import httpx
 from config import cfg
 
 
 async def get_prediction(market_data: dict) -> dict:
+    """
+    Sends market data to OpenAI and gets a directional prediction.
+    Falls back to rule-based scoring if OpenAI is unavailable.
+    """
+    ind = market_data.get("indicators", {})
+    price = market_data.get("current_price", 0)
+    asset = market_data.get("asset", "UNKNOWN")
+    recent = market_data.get("recent_candles", [])
+    last_3 = market_data.get("last_3_direction", "FLAT")
+
+    candles_text = "\n".join(recent[-5:]) if recent else "No recent data"
+
+    prompt = (
+        "You are a professional quantitative trading analyst. "
+        "Analyze the following market data for " + asset +
+        " and decide whether to BUY (UP), SELL (DOWN), or HOLD (NO_TRADE).\n\n"
+        "Current Price: " + str(price) + "\n"
+        "Last 3 candles direction: " + str(last_3) + "\n\n"
+        "Technical Indicators:\n"
+        "- RSI: " + str(ind.get("rsi", "N/A")) + "\n"
+        "- EMA5: " + str(ind.get("ema_5", "N/A")) + " | EMA20: " + str(ind.get("ema_20", "N/A")) + " | EMA50: " + str(ind.get("ema_50", "N/A")) + "\n"
+        "- MACD: " + str(ind.get("macd", "N/A")) + " | Signal: " + str(ind.get("macd_signal", "N/A")) + "\n"
+        "- BB Upper: " + str(ind.get("bb_upper", "N/A")) + " | BB Lower: " + str(ind.get("bb_lower", "N/A")) + "\n"
+        "- ATR: " + str(ind.get("atr", "N/A")) + "\n"
+        "- Trend: " + str(ind.get("trend", "N/A")) + "\n\n"
+        "Recent candles:\n" + candles_text + "\n\n"
+        'Respond ONLY in this exact JSON format:\n'
+        '{"prediction": "UP" or "DOWN" or "NO_TRADE", "confidence": 0-100, "reasoning": "short explanation"}'
+    )
+
+    api_key = cfg.OPENAI_API_KEY
+    if not api_key:
+        print("[AI] No OPENAI_API_KEY found, using rule-based fallback")
+        return _rule_based_prediction(market_data)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": cfg.OPENAI_MODEL,
+                    "messages": [
+                        {"role": "system", "content": "You are a precise financial analyst. Respond only in valid JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": 150
+                }
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = data["choices"][0]["message"]["content"].strip()
+
+            import json
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+            content = content.strip()
+
+            result = json.loads(content)
+            pred = result.get("prediction", "NO_TRADE").upper()
+            conf = float(result.get("confidence", 50))
+            reason = result.get("reasoning", "AI analysis")
+
+            if pred not in ("UP", "DOWN", "NO_TRADE"):
+                pred = "NO_TRADE"
+            conf = max(0, min(100, conf))
+
+            print(f"[AI] {asset}: {pred} @ {conf:.0f}% | {reason[:60]}")
+            return {
+                "prediction": pred,
+                "confidence": round(conf, 2),
+                "score": int(conf),
+                "reasoning": reason,
+                "price_at_signal": round(float(price), 6) if price else 0.0,
+                "timestamp": float(time.time()),
+                "signal_age_ms": 0.0,
+            }
+
+    except Exception as e:
+        print(f"[AI] OpenAI failed ({e}), using rule-based fallback")
+        return _rule_based_prediction(market_data)
+
+
+def _rule_based_prediction(market_data: dict) -> dict:
+    """Original hardcoded logic as fallback."""
     ind = market_data.get("indicators", {})
     price = market_data.get("current_price", 0)
     signal_time = market_data.get("timestamp", time.time())
@@ -10,7 +105,6 @@ async def get_prediction(market_data: dict) -> dict:
     score = 50
     reasons = []
 
-    # RSI
     rsi = ind.get("rsi")
     if rsi is not None:
         try:
@@ -32,7 +126,6 @@ async def get_prediction(market_data: dict) -> dict:
         except (TypeError, ValueError):
             pass
 
-    # Trend
     trend = ind.get("trend")
     if trend == "BULLISH":
         score += 10
@@ -41,7 +134,6 @@ async def get_prediction(market_data: dict) -> dict:
         score -= 10
         reasons.append("Bearish trend")
 
-    # MACD
     macd = ind.get("macd")
     macd_sig = ind.get("macd_signal")
     if macd is not None and macd_sig is not None:
@@ -55,7 +147,6 @@ async def get_prediction(market_data: dict) -> dict:
         except (TypeError, ValueError):
             pass
 
-    # EMA alignment
     ema5 = ind.get("ema_5")
     ema20 = ind.get("ema_20")
     ema50 = ind.get("ema_50")
@@ -71,7 +162,6 @@ async def get_prediction(market_data: dict) -> dict:
         except (TypeError, ValueError):
             pass
 
-    # Bollinger
     bb_up = ind.get("bb_upper")
     bb_low = ind.get("bb_lower")
     if bb_up is not None and bb_low is not None and price:
@@ -86,12 +176,8 @@ async def get_prediction(market_data: dict) -> dict:
         except (TypeError, ValueError):
             pass
 
-    # Clamp
     score = max(0, min(100, int(score)))
 
-    # === THRESHOLDS: 80% minimum confidence ===
-    # UP: score >= 80 gives conf = 80-100%
-    # DOWN: score <= 20 gives conf = 80-100%
     if score >= 80:
         pred = "UP"
         conf = float(score)

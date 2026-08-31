@@ -8,7 +8,7 @@ from database import init_db
 from feature_engine import format_prompt_data
 from openai_predictor import get_prediction
 from signal_manager import SignalManager
-from quotex_client import QuotexClient
+from alpaca_client import AlpacaClient
 from telegram_bot import TelegramNotifier
 
 
@@ -73,7 +73,7 @@ for noisy in ["pyquotex", "websockets", "urllib3", "httpx"]:
 class TradingBot:
     def __init__(self):
         init_db()
-        self.qx = QuotexClient()
+        self.qx = AlpacaClient()
         self.manager = SignalManager()
         self.notifier = TelegramNotifier()
         self.running = False
@@ -150,11 +150,27 @@ class TradingBot:
                     self.daily_profits += 1
                     self.consecutive_losses = 0
                     SafeLog.trade(f"🎯 WIN #{self.daily_profits}/4 | Streak reset")
+                    try:
+                        asyncio.create_task(self.notifier.send_result(trade.get("deal_id", 0), "WIN", 0.0))
+                    except Exception as e:
+                        SafeLog.warn(f"Telegram result failed: {e}")
+                    try:
+                        asyncio.create_task(self.notifier.send_result(trade.get("deal_id", 0), "WIN", 0.0))
+                    except Exception as e:
+                        SafeLog.warn(f"Telegram result failed: {e}")
                     if self.daily_profits >= 4:
                         SafeLog.trade("🏆 DAILY TARGET 4/4 — STOPPING UNTIL TOMORROW")
                 elif result == "LOSS":
                     self.consecutive_losses += 1
                     SafeLog.warn(f"❌ LOSS | Streak: {self.consecutive_losses}/3")
+                    try:
+                        asyncio.create_task(self.notifier.send_result(trade.get("deal_id", 0), "LOSS", 0.0))
+                    except Exception as e:
+                        SafeLog.warn(f"Telegram result failed: {e}")
+                    try:
+                        asyncio.create_task(self.notifier.send_result(trade.get("deal_id", 0), "LOSS", 0.0))
+                    except Exception as e:
+                        SafeLog.warn(f"Telegram result failed: {e}")
                     if self.consecutive_losses >= 3:
                         self.consecutive_loss_cooldown_until = now + 600
                         SafeLog.error("🛑 3 CONSECUTIVE LOSSES — 10 MIN COOLDOWN")
@@ -321,11 +337,12 @@ class TradingBot:
             SafeLog.info("No trade this cycle.")
             return
 
-        # === NEW: Skip if same asset + same direction as last trade ===
+        # === Skip if same asset + same direction as last trade (within 5 min) ===
         pred_dir = best_signal.get("prediction")
         if (best_asset == self.last_trade_asset and 
-            pred_dir == self.last_trade_direction):
-            SafeLog.warn(f"SKIP: {best_asset} {pred_dir} @ {best_confidence:.0f}% — same as last trade")
+            pred_dir == self.last_trade_direction and
+            time.time() - self.last_trade_time < 300):
+            SafeLog.warn(f"SKIP: {best_asset} {pred_dir} — same as last trade (within 5min)")
             return
 
         SafeLog.info(f"[🔄] Re-fetching fresh data for {best_asset}...")
@@ -353,10 +370,11 @@ class TradingBot:
                 SafeLog.warn(f"[🔄] Dropped to {fresh_conf:.0f}%. SKIP.")
                 return
 
-            # Double-check same-asset same-direction after fresh fetch
+            # Double-check same-asset same-direction after fresh fetch (within 5 min)
             if (best_asset == self.last_trade_asset and 
-                fresh_direction == self.last_trade_direction):
-                SafeLog.warn(f"SKIP: {best_asset} {fresh_direction} — same as last trade (fresh confirm)")
+                fresh_direction == self.last_trade_direction and
+                time.time() - self.last_trade_time < 300):
+                SafeLog.warn(f"SKIP: {best_asset} {fresh_direction} — same as last trade (fresh, within 5min)")
                 return
 
             best_signal = fresh_pred
@@ -365,6 +383,12 @@ class TradingBot:
 
         except Exception as e:
             SafeLog.error(f"[🔄] Fresh calc error: {e}")
+            return
+
+        # Alpaca crypto: can only BUY, cannot short-sell without holding the asset
+        pred_dir = best_signal.get("prediction")
+        if pred_dir == "DOWN":
+            SafeLog.warn(f"SKIP: {best_asset} DOWN — Alpaca crypto cannot short-sell without holding")
             return
 
         await self._execute_trade(best_asset, best_signal)
@@ -391,6 +415,18 @@ class TradingBot:
         SafeLog.trade(f"REASON | {reason}")
         SafeLog.trade(f"PRICE | entry={current_price:.5f}")
         SafeLog.trade("=" * 40)
+
+        # Telegram signal alert
+        try:
+            asyncio.create_task(self.notifier.send_signal(pred, conf, "LIVE" if not cfg.PAPER_TRADING else "PAPER", reason))
+        except Exception as e:
+            SafeLog.warn(f"Telegram signal failed: {e}")
+
+        # Telegram alert
+        try:
+            asyncio.create_task(self.notifier.send_signal(pred, conf, "LIVE" if not cfg.PAPER_TRADING else "PAPER", reason))
+        except Exception as e:
+            SafeLog.warn(f"Telegram signal failed: {e}")
 
         now = time.time()
         self.active_trade_until = now + cfg.TIMEFRAME
