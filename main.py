@@ -1,6 +1,7 @@
 import asyncio
 import time
 import logging
+import os
 from datetime import datetime, timezone, timedelta
 
 from config import cfg
@@ -10,6 +11,12 @@ from openai_predictor import get_prediction
 from signal_manager import SignalManager
 from alpaca_client import AlpacaClient
 from telegram_bot import TelegramNotifier
+
+# === TRAILING STOP SETTINGS ===
+# Set these in your .env or Railway variables, or keep defaults
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "2.0"))   # Close at +2%
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "1.0"))       # Close at -1%
+MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES", "60"))    # Force close after 60 min
 
 
 class SafeLog:
@@ -98,6 +105,10 @@ class TradingBot:
         self.last_trade_confidence = 0.0
         self.last_status_time = 0.0
 
+        self.take_profit_pct = TAKE_PROFIT_PCT
+        self.stop_loss_pct = STOP_LOSS_PCT
+        self.max_hold_minutes = MAX_HOLD_MINUTES
+
     def _check_hourly_reset(self):
         now = datetime.now(timezone.utc)
         if now.hour != self.hourly_reset.hour:
@@ -139,10 +150,6 @@ class TradingBot:
         return True, "OK"
 
     def _get_session_info(self) -> tuple[int, str]:
-        """
-        Active sessions: Tokyo (00-09 UTC), London (08-17 UTC), New York (13-22 UTC).
-        During sessions: scan every 10 minutes. Outside: scan every 60 minutes.
-        """
         now = datetime.now(timezone.utc)
         hour = now.hour
 
@@ -155,42 +162,103 @@ class TradingBot:
 
         return 3600, "OFF-HOURS"
 
+    async def _close_trade(self, trade: dict, current_price: float, result: str):
+        """Close a trade, update stats, send Telegram, and remove from pending."""
+        asset = trade["asset"]
+        deal_id = trade.get("deal_id", "")
+        entry_price = trade["entry_price"]
+        direction = trade["direction"]
+
+        # Close live position on Alpaca if needed
+        if not deal_id.startswith("PAPER_") and not cfg.PAPER_TRADING:
+            try:
+                close_direction = "PUT" if direction == "CALL" else "CALL"
+                await self.qx.place_trade(asset, cfg.AMOUNT, close_direction, cfg.TIMEFRAME)
+                SafeLog.info(f"CLOSED | {asset} position on Alpaca")
+            except Exception as e:
+                SafeLog.warn(f"Close position failed: {e}")
+
+        # Calculate P&L %
+        if direction == "CALL":
+            pnl_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price else 0
+        else:
+            pnl_pct = ((entry_price - current_price) / entry_price) * 100 if entry_price else 0
+
+        # Record result
+        if result == "WIN":
+            self.daily_profits += 1
+            self.consecutive_losses = 0
+            SafeLog.trade(f"WIN #{self.daily_profits}/4 | +{pnl_pct:.2f}%")
+            if self.daily_profits >= 4:
+                SafeLog.trade("DAILY TARGET 4/4 — STOPPING UNTIL TOMORROW")
+            try:
+                asyncio.create_task(self.notifier.send_result(deal_id, "WIN", pnl_pct))
+            except Exception as e:
+                SafeLog.warn(f"Telegram result failed: {e}")
+        elif result == "LOSS":
+            self.consecutive_losses += 1
+            SafeLog.warn(f"LOSS | Streak: {self.consecutive_losses}/3 | {pnl_pct:.2f}%")
+            if self.consecutive_losses >= 3:
+                self.consecutive_loss_cooldown_until = time.time() + 600
+                SafeLog.error("3 CONSECUTIVE LOSSES — 10 MIN COOLDOWN")
+            try:
+                asyncio.create_task(self.notifier.send_result(deal_id, "LOSS", pnl_pct))
+            except Exception as e:
+                SafeLog.warn(f"Telegram result failed: {e}")
+        elif result == "TIE":
+            SafeLog.info("TIE | No change")
+            try:
+                asyncio.create_task(self.notifier.send_result(deal_id, "TIE", 0.0))
+            except Exception as e:
+                SafeLog.warn(f"Telegram result failed: {e}")
+
+        self.pending_trades.remove(trade)
+        self.active_trade_until = 0  # Allow new trades immediately
+
     async def _check_pending_trades(self):
         now = time.time()
         for trade in self.pending_trades[:]:
-            if now >= trade["expires_at"]:
-                result = await self._get_trade_result(trade)
-                deal_id_short = str(trade.get("deal_id", "???"))[:20]
-                SafeLog.info(f"RESULT | ID:{deal_id_short} | {result}")
+            asset = trade["asset"]
+            direction = trade["direction"]
+            entry_price = trade["entry_price"]
+            placed_at = trade["placed_at"]
 
-                if result == "WIN":
-                    self.daily_profits += 1
-                    self.consecutive_losses = 0
-                    SafeLog.trade(f"WIN #{self.daily_profits}/4 | Streak reset")
-                    if self.daily_profits >= 4:
-                        SafeLog.trade("DAILY TARGET 4/4 — STOPPING UNTIL TOMORROW")
-                    try:
-                        asyncio.create_task(self.notifier.send_result(trade.get("deal_id", 0), "WIN", 0.0))
-                    except Exception as e:
-                        SafeLog.warn(f"Telegram result failed: {e}")
-                elif result == "LOSS":
-                    self.consecutive_losses += 1
-                    SafeLog.warn(f"LOSS | Streak: {self.consecutive_losses}/3")
-                    if self.consecutive_losses >= 3:
-                        self.consecutive_loss_cooldown_until = now + 600
-                        SafeLog.error("3 CONSECUTIVE LOSSES — 10 MIN COOLDOWN")
-                    try:
-                        asyncio.create_task(self.notifier.send_result(trade.get("deal_id", 0), "LOSS", 0.0))
-                    except Exception as e:
-                        SafeLog.warn(f"Telegram result failed: {e}")
-                elif result == "TIE":
-                    SafeLog.info("TIE | No change")
-                else:
-                    SafeLog.warn(f"UNKNOWN result")
+            # Fetch current price
+            candles = await self.qx.get_candles(asset, cfg.TIMEFRAME, 5)
+            if not candles:
+                continue
+            current_price = candles[-1]["close"]
 
-                self.pending_trades.remove(trade)
+            # Calculate unrealized P&L %
+            if direction == "CALL":
+                pnl_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price else 0
+            else:
+                pnl_pct = ((entry_price - current_price) / entry_price) * 100 if entry_price else 0
+
+            SafeLog.info(f"  P&L CHECK | {asset} | entry={entry_price:.2f} | current={current_price:.2f} | {pnl_pct:+.2f}%")
+
+            # 1. TAKE PROFIT
+            if pnl_pct >= self.take_profit_pct:
+                SafeLog.trade(f"TAKE PROFIT TRIGGERED | {asset} | {pnl_pct:.2f}%")
+                await self._close_trade(trade, current_price, "WIN")
+                continue
+
+            # 2. STOP LOSS
+            if pnl_pct <= -self.stop_loss_pct:
+                SafeLog.warn(f"STOP LOSS TRIGGERED | {asset} | {pnl_pct:.2f}%")
+                await self._close_trade(trade, current_price, "LOSS")
+                continue
+
+            # 3. MAX HOLD TIME
+            elapsed_min = (now - placed_at) / 60
+            if elapsed_min >= self.max_hold_minutes:
+                result = "WIN" if pnl_pct > 0 else "LOSS" if pnl_pct < 0 else "TIE"
+                SafeLog.info(f"MAX HOLD TIME | {asset} | held {elapsed_min:.0f}min | {pnl_pct:+.2f}% | {result}")
+                await self._close_trade(trade, current_price, result)
+                continue
 
     async def _get_trade_result(self, trade: dict) -> str:
+        """Legacy fallback — not used by trailing stop logic but kept for compatibility."""
         deal_id = trade.get("deal_id", "")
         asset = trade.get("asset", "")
         direction = trade.get("direction", "")
@@ -253,16 +321,21 @@ class TradingBot:
         hours_idle = since_last // 3600
         mins_idle = (since_last % 3600) // 60
 
+        # Count open positions
+        open_count = len(self.pending_trades)
+
         msg = (
             f"⚪ <b>Market Status Update</b> ⚪\n\n"
             f"<b>Assets:</b> {', '.join(self.assets)}\n"
             f"<b>Best Signal:</b> {best_asset or 'None'}\n"
             f"<b>Direction:</b> {best_pred or 'N/A'}\n"
             f"<b>Confidence:</b> {best_conf:.0f}%\n"
-            f"<b>Status:</b> {reason}\n\n"
+            f"<b>Status:</b> {reason}\n"
+            f"<b>Open Trades:</b> {open_count}\n\n"
             f"<b>Idle Time:</b> {hours_idle}h {mins_idle}m\n"
             f"<b>Daily Wins:</b> {self.daily_profits}/4\n"
             f"<b>Consecutive Losses:</b> {self.consecutive_losses}/3\n"
+            f"<b>TP/SL:</b> +{self.take_profit_pct}% / -{self.stop_loss_pct}%\n"
             f"<b>Mode:</b> {'PAPER 📄' if cfg.PAPER_TRADING else 'LIVE ⚠️'}"
         )
 
@@ -292,10 +365,11 @@ class TradingBot:
         SafeLog.info(f"Paper: {cfg.PAPER_TRADING}")
         SafeLog.info(f"Amount: ${cfg.AMOUNT}")
         SafeLog.info(f"Min confidence: {cfg.MIN_CONFIDENCE}%")
+        SafeLog.info(f"Take Profit: +{self.take_profit_pct}%")
+        SafeLog.info(f"Stop Loss: -{self.stop_loss_pct}%")
+        SafeLog.info(f"Max Hold: {self.max_hold_minutes}min")
         SafeLog.info(f"Daily profit target: 4 wins then STOP")
         SafeLog.info(f"Consecutive loss limit: 3 = 10 min break")
-        SafeLog.info(f"No overlap: waits {cfg.TIMEFRAME}s between trades")
-        SafeLog.info(f"No repeat: same asset+direction skipped")
         SafeLog.info("=" * 50)
 
         while self.running:
@@ -479,7 +553,8 @@ class TradingBot:
             SafeLog.warn(f"Telegram signal failed: {e}")
 
         now = time.time()
-        self.active_trade_until = now + cfg.TIMEFRAME
+        # Block new trades until this one closes (max hold time)
+        self.active_trade_until = now + (self.max_hold_minutes * 60)
         self.last_trade_time = now
         self.hourly_trades += 1
 
@@ -496,7 +571,7 @@ class TradingBot:
                 "direction": direction,
                 "entry_price": current_price,
                 "placed_at": now,
-                "expires_at": now + cfg.TIMEFRAME
+                "expires_at": now + (self.max_hold_minutes * 60)
             })
             return
 
@@ -518,7 +593,7 @@ class TradingBot:
                 "direction": direction,
                 "entry_price": current_price,
                 "placed_at": now,
-                "expires_at": now + cfg.TIMEFRAME
+                "expires_at": now + (self.max_hold_minutes * 60)
             })
         else:
             SafeLog.error(f"BROKER_REJECT | {asset} | {result}")
